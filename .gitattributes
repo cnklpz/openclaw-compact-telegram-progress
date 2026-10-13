@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Unified-diff context markers contain intentional trailing spaces.
+*.patch text eol=lf -whitespace

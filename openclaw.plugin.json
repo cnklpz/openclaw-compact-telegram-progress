@@ -1,0 +1,10 @@
+{
+  "id": "compact-telegram-progress",
+  "name": "Compact Telegram progress",
+  "description": "Ordinary tool category reducer; requires host ordinaryToolProgress.v1.",
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object", "additionalProperties": false,
+    "properties": { "enabled": { "type": "boolean", "default": true } }
+  }
+}

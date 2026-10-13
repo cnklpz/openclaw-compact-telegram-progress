@@ -1,0 +1,1896 @@
+diff --git a/docs/plugins/sdk-runtime/channel.md b/docs/plugins/sdk-runtime/channel.md
+index 712f23d2..0ee4b83a 100644
+--- a/docs/plugins/sdk-runtime/channel.md
++++ b/docs/plugins/sdk-runtime/channel.md
+@@ -198,3 +198,30 @@ lifecycle setters still require their own persistence migrations. Other bundled
+ stores also retain their existing behavior until their respective cutovers.
+ Worker-backed route reads and activity updates do not imply a fully migrated
+ binding service or stronger durability for those remaining operations.
++
++
++## Isolated v1 turn-display extension seam
++
++The Telegram display bridge prototype for base `e178c39` uses
++`api.runtime.channel.runtimeContexts.get({ channelId: "telegram", capability })`.
++The two capability keys are `finalUsageFooter.v1` (reviewed owner
++`token-speed-footer`) and `ordinaryToolProgress.v1` (`compact-telegram-progress`).
++They are loader-instance-bound, not authenticated by a caller-supplied plugin ID.
++Registration requires the actual API lifecycle signal and returns a disposal lease;
++raw registry replacement of these host-owned keys is refused.
++
++The host snapshots the one published plugin generation for each admitted Telegram
++turn. Replacement registrations can be staged before publication but cannot adopt
++old turns. The formatter receives official whole-turn aggregate usage and wall
++duration, returns bounded literal text, and does not register a modifying send hook.
++Undefined, exceptions, malformed output, cancellation or retirement retain native
++behavior. The reducer sees only public call/name/phase/status summaries and returns
++at most three bounded ordinary category rows; approval, plan, reasoning, headline
++and final message custody remain native. Native direct callbacks carry an opaque
++per-event projection token into the serialized compositor queue, avoiding
++concurrent same-call or different-call handoff loss. No transport client, token,
++message edit/delete authority or ingress elevation is exposed to the helpers.
++
++This patch is not part of an installed/live Gateway until separately built,
++reviewed and deployed by its operator. Synthetic transport tests are actual host
++integration evidence, not live Telegram acceptance.
+diff --git a/extensions/telegram/src/bot-message-dispatch-progress.ts b/extensions/telegram/src/bot-message-dispatch-progress.ts
+index 84d4a08f..0d9dbff8 100644
+--- a/extensions/telegram/src/bot-message-dispatch-progress.ts
++++ b/extensions/telegram/src/bot-message-dispatch-progress.ts
+@@ -1,5 +1,7 @@
+ import {
+   createChannelProgressDraftCompositor,
++  createTurnDisplayLease,
++  type TurnDisplayLease,
+   createLivePreviewLifecycle,
+   createPreviewMessageReceipt,
+   resolveChannelProgressDraftMaxLineChars,
+@@ -85,6 +87,101 @@ export function createProgressState(
+   draftState: TelegramProgressDraftState,
+   getTurn: () => Turn,
+ ): TelegramProgressStateSlice {
++  // The generated plugin-sdk barrel resolves this exported type as `any` under oxlint;
++  // the source typecheck still verifies the concrete lease contract.
++  // oxlint-disable-next-line typescript/no-redundant-type-constituents
++  let displayLease: TurnDisplayLease | undefined;
++  let displayIdentity: { runId: string; sessionId: string } | undefined;
++  let displaySequence = 0;
++  type Projection = {
++    rows: readonly { category: string; status: string; text: string }[];
++    isCurrent: () => boolean;
++  };
++  let projections = new WeakMap<object, Projection>();
++  const displayExtensions = {
++    start(identity: { runId: string; sessionId: string }) {
++      displayLease?.close();
++      displaySequence = 0;
++      projections = new WeakMap();
++      displayIdentity = identity;
++      const sessionKey = config.context.ctxPayload.SessionKey;
++      if (!sessionKey || config.context.ctxPayload.GroupThread || config.isSuperseded()) {
++        return;
++      }
++      displayLease = createTurnDisplayLease(
++        {
++          channel: "telegram",
++          accountId: config.context.route.accountId,
++          sessionKey,
++          sessionId: identity.sessionId,
++          runId: identity.runId,
++          conversationId: String(config.context.chatId),
++          threadId:
++            config.context.threadSpec.id == null ? null : String(config.context.threadSpec.id),
++        },
++        config.turnAdoptionLifecycle?.abortSignal,
++      );
++    },
++    tool(facts: {
++      runId: string;
++      sessionId: string;
++      event: Omit<import("openclaw/plugin-sdk/channel-outbound").OrdinaryToolSummary, "seq">;
++    }) {
++      if (
++        config.isSuperseded() ||
++        facts.runId !== displayIdentity?.runId ||
++        facts.sessionId !== displayIdentity?.sessionId
++      ) {
++        return undefined;
++      }
++      // Direct native callbacks omit AgentEventPayload.seq. This turn owner assigns
++      // one deterministic sequence across provider attempts, before any queued I/O.
++      const owner = displayLease;
++      const rows = owner?.progress({ ...facts.event, seq: ++displaySequence });
++      if (!rows || !owner) {
++        return undefined;
++      }
++      const token = Object.freeze({});
++      projections.set(token, {
++        rows,
++        isCurrent: () =>
++          owner.isProgressActive() &&
++          displayIdentity?.runId === facts.runId &&
++          displayIdentity?.sessionId === facts.sessionId,
++      });
++      return token;
++    },
++    rows(token?: object) {
++      if (!token) {
++        return undefined;
++      }
++      const projection = projections.get(token);
++      projections.delete(token);
++      return projection;
++    },
++    footer(facts: {
++      runId: string;
++      sessionId: string;
++      usageState?: import("openclaw/plugin-sdk/channel-outbound").TurnDisplayEvent["usageState"];
++    }) {
++      if (
++        config.isSuperseded() ||
++        facts.runId !== displayIdentity?.runId ||
++        facts.sessionId !== displayIdentity?.sessionId
++      ) {
++        return undefined;
++      }
++      return displayLease?.finalize(facts.usageState);
++    },
++    freeze() {
++      displayLease?.freezeProgress();
++      projections = new WeakMap();
++    },
++    close() {
++      displayLease?.close(config.isSuperseded() ? "cancel" : "settled");
++      projections = new WeakMap();
++    },
++  };
+   const progressCompositor = createChannelProgressDraftCompositor({
+     preparedItems: true,
+     entry: config.telegramCfg,
+@@ -145,12 +242,16 @@ export function createProgressState(
+         }
+       : undefined,
+     cleanupUndelivered: true,
+-    onFinalStarted: () => progressCompositor.markFinalReplyStarted(),
++    onFinalStarted: () => {
++      displayExtensions.freeze();
++      progressCompositor.markFinalReplyStarted();
++    },
+     onFinalDelivered: () => progressCompositor.markFinalReplyDelivered(),
+     onCleanupFailure: (error) =>
+       config.runtime.error?.(`telegram preview cleanup failed: ${formatErrorMessage(error)}`),
+   });
+   return {
++    displayExtensions,
+     verboseProgressActive: () => false,
+     progressCompositor,
+     previewLifecycle,
+@@ -238,6 +339,7 @@ function canPushCompactionProgress(turn: Turn): boolean {
+ 
+ export async function pushToolProgress(
+   turn: Turn,
++  // oxlint-disable-next-line typescript/no-redundant-type-constituents
+   line?: string | ChannelProgressDraftLine,
+   options?: { toolName?: string; startImmediately?: boolean; id?: string },
+ ): Promise<boolean> {
+@@ -315,8 +417,12 @@ export async function handleItemEvent(
+   payload: CallbackPayload<"onItemEvent">,
+ ): Promise<boolean> {
+   let rendered = false;
++  const projection = turn.displayExtensions.rows(payload.turnDisplayProjection);
+   await enqueueDraftEvent(turn, async () => {
+-    if (turn.previewLifecycle.finalStarted) {
++    if (
++      turn.previewLifecycle.finalStarted ||
++      (payload.turnDisplayProjection && (!projection || !projection.isCurrent()))
++    ) {
+       return;
+     }
+     if (
+@@ -330,6 +436,18 @@ export async function handleItemEvent(
+       await rotateAnswerLaneForNewMessage(turn);
+       turn.progressCompositor.resetActivity();
+     }
++    if (
++      projection?.isCurrent() &&
++      payload.kind === "tool" &&
++      payload.status !== "failed" &&
++      payload.status !== "blocked" &&
++      !payload.approvalId &&
++      !payload.hideFromChannelProgress &&
++      !payload.suppressChannelProgress
++    ) {
++      rendered = await turn.progressCompositor.replaceOrdinaryToolLines(projection.rows);
++      return;
++    }
+     rendered =
+       (payload.kind === "preamble" || canPushToolProgress(turn)) &&
+       (await turn.progressCompositor.pushItemEvent(payload));
+diff --git a/extensions/telegram/src/bot-message-dispatch-turn.ts b/extensions/telegram/src/bot-message-dispatch-turn.ts
+index 8aae4721..f72eacce 100644
+--- a/extensions/telegram/src/bot-message-dispatch-turn.ts
++++ b/extensions/telegram/src/bot-message-dispatch-turn.ts
+@@ -151,6 +151,9 @@ export async function runTelegramDispatchTurn(turn: Turn) {
+             onSkip: (payload, info) => handleReplySkip(turn, payload, info),
+           },
+           replyOptions: {
++            onTurnDisplayStart: (identity) => turn.displayExtensions.start(identity),
++            onTurnDisplayTool: (facts) => turn.displayExtensions.tool(facts),
++            onFinalUsageFooter: (facts) => turn.displayExtensions.footer(facts),
+             ...(context.ctxPayload.CommandSource === "native"
+               ? { [PLUGIN_COMMAND_DISPATCH]: { kind: "non-plugin" as const } }
+               : {}),
+diff --git a/extensions/telegram/src/bot-message-dispatch.ts b/extensions/telegram/src/bot-message-dispatch.ts
+index 8bd71a14..aa2148e4 100644
+--- a/extensions/telegram/src/bot-message-dispatch.ts
++++ b/extensions/telegram/src/bot-message-dispatch.ts
+@@ -369,6 +369,7 @@ export const dispatchTelegramMessage = async (
+       runtime.error?.(danger(`telegram dispatch failed: ${String(err)}`));
+     } finally {
+       // Stop producers before draining drafts, finalizing accepted text, and cleaning previews.
++      turn.displayExtensions.close();
+       turn.progressCompositor.cancel();
+       await turn.draftEventQueue;
+       try {
+diff --git a/extensions/telegram/src/bot-message-dispatch.turn-display.test.ts b/extensions/telegram/src/bot-message-dispatch.turn-display.test.ts
+new file mode 100644
+index 00000000..21fe647b
+--- /dev/null
++++ b/extensions/telegram/src/bot-message-dispatch.turn-display.test.ts
+@@ -0,0 +1,355 @@
++import { afterEach, expect, it, vi } from "vitest";
++import { createAgentRunEventHandler } from "../../../src/auto-reply/reply/agent-runner-event-handler.js";
++import { accountAgentTurn } from "../../../src/auto-reply/reply/agent-runner-result-accounting.js";
++import { completeReplyAgentRun } from "../../../src/auto-reply/reply/agent-runner-result-complete.js";
++import { resolveResponseUsageLine } from "../../../src/auto-reply/reply/agent-runner-usage-line.js";
++import { createTurnDisplayLease } from "../../../src/channels/turn-display-extensions.js";
++import type { PluginInstanceHandle } from "../../../src/plugins/plugin-instance-scope.js";
++import { registerFooterPlugin } from "../../../test/fixtures/turn-display-plugins/footer/registration.js";
++import { registerProgressPlugin } from "../../../test/fixtures/turn-display-plugins/progress/registration.mjs";
++import { pluginFixture } from "../../../test/fixtures/turn-display-plugins/registry.js";
++import {
++  createBot,
++  createContext,
++  createDirectSessionPayload,
++  createTelegramDraftStream,
++  deliverReplies,
++  describeTelegramDispatch,
++  dispatchReplyWithBufferedBlockDispatcher,
++  dispatchWithContext,
++  editMessageTelegram,
++} from "./bot-message-dispatch.test-harness.js";
++import type * as DeliveryModule from "./bot/delivery.replies.js";
++import type * as DraftModule from "./draft-stream.js";
++import type { TelegramDraftStream } from "./draft-stream.js";
++import type * as EditModule from "./send-edit.js";
++import { planTelegramTextDeliveryPages } from "./telegram-text-delivery.js";
++
++const instances: PluginInstanceHandle[] = [];
++afterEach(async () => {
++  for (const instance of instances.splice(0)) await instance.dispose();
++});
++function registerPlugins() {
++  const footer = pluginFixture("token-speed-footer", { deliveryMode: "preview-safe" });
++  const progress = pluginFixture("compact-telegram-progress");
++  instances.push(footer.instance, progress.instance);
++  registerFooterPlugin(footer.api);
++  registerProgressPlugin(progress.api);
++  expect(footer.builder.registry.typedHooks).toHaveLength(0);
++  expect(progress.builder.registry.typedHooks).toHaveLength(0);
++  return { footer, progress };
++}
++
++// Real official aggregate accounting and result completion, with provider output
++// injected as a settled execution fixture. Storage is absent, not a real session.
++async function finishNative(
++  opts: Parameters<typeof completeReplyAgentRun>[0]["context"]["opts"],
++  usage: { input: number; output: number; total: number } | undefined,
++  text: string,
++  durationMs = 2500,
++) {
++  const now = 10000;
++  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
++  try {
++    const context = {
++      cfg: { messages: { responseUsage: "full" } },
++      defaultModel: "fixture",
++      followupRun: {
++        run: {
++          agentId: "fixture",
++          agentDir: "/synthetic/no-auth",
++          sessionId: "session-1",
++          provider: "fixture",
++          model: "fixture",
++          verboseLevel: "off",
++        },
++      },
++      opts,
++      runId: "run-1",
++      runStartedAt: now - durationMs,
++      pendingToolTasks: new Set(),
++      sessionCtx: {},
++      resolvedVerboseLevel: "off",
++      execution: {
++        result: {
++          payloads: [{ text }],
++          meta: {
++            agentMeta: {
++              usage,
++              lastCallUsage: { input: 1, output: 2, total: 3 },
++              contextTokens: 1000,
++            },
++          },
++        },
++        resolved: { provider: "fixture", model: "fixture" },
++        fallback: { exhausted: false, attempts: [] },
++        status: "ok",
++      },
++      activeIsNewSession: false,
++      isHeartbeat: false,
++      returnWithQueuedFollowupDrain: (value: unknown) => value,
++    } as unknown as Parameters<typeof completeReplyAgentRun>[0]["context"];
++    const accounting = await accountAgentTurn(context);
++    expect(accounting.replyUsageState.usage).toEqual(
++      usage && {
++        ...usage,
++        cacheRead: undefined,
++        cacheWrite: undefined,
++      },
++    );
++    expect(accounting.replyUsageState.durationMs).toBe(durationMs);
++    const responseUsageLine = resolveResponseUsageLine({
++      config: context.cfg,
++      agentDir: "/synthetic/no-auth",
++      channel: "telegram",
++      usage,
++      replyUsageState: accounting.replyUsageState,
++    });
++    return await completeReplyAgentRun({
++      context,
++      accounting,
++      prepared: {
++        kind: "continue",
++        guardedReplyPayloads: [{ text }],
++        responseUsageLine,
++        completedSourceReplyDelivery: false,
++      } as Parameters<typeof completeReplyAgentRun>[0]["prepared"],
++    });
++  } finally {
++    clock.mockRestore();
++  }
++}
++
++describeTelegramDispatch("actual host turn-display registry and Telegram native pipeline", () => {
++  it.each(["partial", "progress"] as const)(
++    "keeps native %s preview and substitutes one official aggregate footer",
++    async (mode) => {
++      registerPlugins();
++      const draftModule = await vi.importActual<typeof DraftModule>("./draft-stream.js");
++      const deliveryModule = await vi.importActual<typeof DeliveryModule>(
++        "./bot/delivery.replies.js",
++      );
++      const editModule = await vi.importActual<typeof EditModule>("./send-edit.js");
++      deliverReplies.mockImplementation(deliveryModule.deliverStructuredReplies);
++      editMessageTelegram.mockImplementation(editModule.editMessageTelegram);
++      let draft: TelegramDraftStream | undefined;
++      createTelegramDraftStream.mockImplementation((params) => {
++        const stream = draftModule.createTelegramDraftStream(params);
++        draft ??= stream;
++        return stream;
++      });
++      let finalPayload: { text?: string } | undefined;
++      const bot = createBot();
++      const visible = new Map<number, string>();
++      let id = 1000;
++      vi.spyOn(bot.api, "sendMessage").mockImplementation(async (_chat, text) => {
++        visible.set(++id, text);
++        return {
++          message_id: id,
++          message_thread_id: 777,
++          date: 0,
++          chat: { id: 123, type: "private", first_name: "Fixture" },
++          text,
++        };
++      });
++      const edit = vi
++        .spyOn(bot.api, "editMessageText")
++        .mockImplementation(async (_chat, messageId, text) => {
++          visible.set(messageId, text);
++          return true;
++        });
++      vi.spyOn(bot.api, "deleteMessage").mockImplementation(async (_chat, messageId) => {
++        visible.delete(messageId);
++        return true;
++      });
++      dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
++        async ({ dispatcherOptions, replyOptions }) => {
++          replyOptions?.onTurnDisplayStart?.({ runId: "run-1", sessionId: "session-1" });
++          const eventHandler = createAgentRunEventHandler({
++            turn: { opts: replyOptions, sessionCtx: { MessageSid: "456" } },
++            lifecycleBackstop: { note() {} },
++            notifyAgentRunStart() {},
++            sourceRepliesAreToolOnly: false,
++            provider: "fixture",
++            model: "fixture",
++            effectiveSessionId: "session-1",
++            displayRunId: "run-1",
++            notifyUserAboutCompaction: false,
++            onCompactionCompleted: () => 0,
++            messageToolDeliveryState: { toolCallIds: new Set(), completed: false },
++          } as unknown as Parameters<typeof createAgentRunEventHandler>[0]);
++          const tool = (
++            callId: string,
++            toolName: string,
++            phase: "start" | "end",
++            status = "running",
++          ) =>
++            eventHandler({
++              stream: "item",
++              data: {
++                kind: "tool",
++                toolCallId: callId,
++                itemId: `tool:${callId}`,
++                name: toolName,
++                phase,
++                status,
++                meta: "SECRET-ARG-NEVER-DISPLAY",
++                args: { private: "SECRET" },
++              },
++            });
++          await Promise.all([tool("old", "read", "start"), tool("new", "read", "start")]);
++          await tool("e", "exec", "start");
++          await tool("s", "web_search", "start");
++          await tool("w", "write", "start");
++          await tool("new", "read", "end", "completed");
++          await tool("old", "read", "end", "completed");
++          await draft?.flush();
++          const card = [...visible.values()].join("\n");
++          expect(card).toContain("读取资料");
++          expect(card).toContain("检索信息");
++          expect(card).toContain("更新文件");
++          expect(card).not.toContain("执行操作");
++          expect(card).not.toContain("SECRET");
++          await replyOptions?.onPartialReply?.({ text: "**Answer** <safe> 😀" });
++          await draft?.flush();
++          const payload = await finishNative(
++            replyOptions,
++            { input: 1200, output: 300, total: 1500 },
++            "**Answer** <safe> 😀",
++          );
++          finalPayload = payload as { text?: string };
++          expect(Array.isArray(payload)).toBe(false);
++          await dispatcherOptions.deliver(payload as { text: string }, { kind: "final" });
++          // Final-start is fenced by the native lifecycle; no late edit may revive the card.
++          await tool("late", "exec", "start");
++          return { queuedFinal: true };
++        },
++      );
++      const runtimeError = vi.fn();
++      await dispatchWithContext({
++        runtime: {
++          error: runtimeError,
++          log: vi.fn(),
++          exit: () => {
++            throw new Error("exit");
++          },
++        },
++        bot,
++        context: createContext({ ctxPayload: createDirectSessionPayload() }),
++        streamMode: mode,
++        telegramCfg: {
++          streaming: {
++            mode,
++            block: { enabled: false },
++            progress: { toolProgress: true, maxLines: 8 },
++          },
++        },
++      });
++      expect(runtimeError.mock.calls).toEqual([]);
++      expect(createTelegramDraftStream).toHaveBeenCalled();
++      expect(bot.api.sendMessage).toHaveBeenCalled();
++      expect(edit).toHaveBeenCalled();
++      const final = [...visible.values()].join("\n");
++      // The official completion pipeline received the bounded replacement before
++      // the native Telegram sender owns page splitting/transport formatting.
++      expect((finalPayload as { text: string }).text.match(/🧮/gu)).toHaveLength(1);
++      expect((finalPayload as { text: string }).text).toContain("输入 1,200");
++      expect((finalPayload as { text: string }).text).toContain("输出 300");
++      expect((finalPayload as { text: string }).text).toContain("总计 1,500");
++      expect((finalPayload as { text: string }).text).toContain("120 token/秒");
++      expect((finalPayload as { text: string }).text).not.toContain("Usage:");
++      expect(visible.size).toBeGreaterThanOrEqual(2);
++      expect(final.match(/🧮/gu)).toHaveLength(1);
++      expect(final).toContain("总计 1,500");
++      expect((finalPayload as { text: string }).text).not.toContain("读取资料");
++      expect((finalPayload as { text: string }).text).not.toContain("检索信息");
++      expect((finalPayload as { text: string }).text).not.toContain("更新文件");
++      expect((finalPayload as { text: string }).text).not.toContain("处理任务");
++    },
++  );
++  it("uses native fallback for unavailable usage, exceptions and revoked owner; omits zero-duration speed", async () => {
++    const { footer } = registerPlugins();
++    const scope = {
++      channel: "telegram" as const,
++      accountId: "a",
++      conversationId: "c",
++      threadId: null,
++      sessionKey: "key",
++      sessionId: "session-1",
++      runId: "run-1",
++    };
++    const lease = createTurnDisplayLease(scope);
++    const callback = {
++      onFinalUsageFooter: (facts: { usageState?: Parameters<typeof lease.finalize>[0] }) =>
++        lease.finalize(facts.usageState),
++    };
++    const noUsage = await finishNative(callback, undefined, "No usage");
++    expect(noUsage).toMatchObject({ text: "No usage" });
++    const zeroLease = createTurnDisplayLease({ ...scope, runId: "zero" });
++    const zero = await finishNative(
++      { onFinalUsageFooter: (facts) => zeroLease.finalize(facts.usageState) },
++      { input: 10, output: 20, total: 30 },
++      "Zero wall",
++      0,
++    );
++    expect(zero).toMatchObject({ text: expect.stringContaining("回合耗时 0.00秒") });
++    expect(JSON.stringify(zero)).not.toContain("token/秒");
++    await footer.instance.drain();
++    const native = await finishNative({}, { input: 10, output: 20, total: 30 }, "Native fallback");
++    const fallback = await finishNative(
++      callback,
++      { input: 10, output: 20, total: 30 },
++      "Native fallback",
++    );
++    expect(fallback).toEqual(native);
++    const thrown = await finishNative(
++      {
++        onFinalUsageFooter() {
++          throw new Error("fixture");
++        },
++      },
++      { input: 10, output: 20, total: 30 },
++      "Throw fallback",
++    );
++    expect((thrown as { text: string }).text).toContain("fixture🤖fixture");
++    expect((thrown as { text: string }).text).not.toContain("🧮");
++    lease.close();
++    zeroLease.close();
++  });
++  it("treats formatter HTML/Markdown as literal text through official completion and Telegram rendering", async () => {
++    const payload = await finishNative(
++      { onFinalUsageFooter: () => "🧮 <b>literal</b> [label](https://example.invalid) & 😀" },
++      { input: 10, output: 20, total: 30 },
++      "**Answer**",
++    );
++    const pages = planTelegramTextDeliveryPages({
++      text: (payload as { text: string }).text,
++      maxChars: 4096,
++    });
++    expect(pages[0].plainText).toContain("literal [label](https://example.invalid) & 😀");
++    expect(pages[0].htmlText).toContain("literal");
++    expect(pages[0].htmlText).toContain("https://example.invalid");
++  });
++
++  it.each([false, true])(
++    "plans legal UTF-16 pages through the real Telegram renderer (rich=%s)",
++    (richMessages) => {
++      const footer =
++        "🧮 用量：输入 1,200 · 输出 300 · 总计 1,500 · 输出速度 120 token/秒（回合耗时）";
++      for (const size of [3900, 4090, 8100]) {
++        const text = `${"😀 **safe** <&> ".repeat(size / 10)}\n\n${footer}`;
++        const pages = planTelegramTextDeliveryPages({ text, maxChars: 4096, richMessages });
++        expect(pages.length).toBeGreaterThan(1);
++        expect(pages.every((page) => page.plainText.length <= 4096)).toBe(true);
++        expect(
++          pages
++            .map((page) => page.plainText)
++            .join("\n")
++            .match(/🧮/gu),
++        ).toHaveLength(1);
++        expect(pages.at(-1)?.plainText).toContain(footer);
++        expect(pages.every((page) => !/[\uD800-\uDBFF]$/u.test(page.plainText))).toBe(true);
++      }
++    },
++  );
++});
+diff --git a/extensions/telegram/src/bot-message-dispatch.types.ts b/extensions/telegram/src/bot-message-dispatch.types.ts
+index 536b80b5..7dab404b 100644
+--- a/extensions/telegram/src/bot-message-dispatch.types.ts
++++ b/extensions/telegram/src/bot-message-dispatch.types.ts
+@@ -153,6 +153,29 @@ export type TelegramDraftStateSlice = {
+ };
+ 
+ export type TelegramProgressStateSlice = {
++  displayExtensions: {
++    start(identity: { runId: string; sessionId: string }): void;
++    tool(facts: {
++      runId: string;
++      sessionId: string;
++      event: Omit<import("openclaw/plugin-sdk/channel-outbound").OrdinaryToolSummary, "seq">;
++    }): object | undefined;
++    rows(
++      token?: object,
++    ):
++      | {
++          rows: readonly { category: string; status: string; text: string }[];
++          isCurrent: () => boolean;
++        }
++      | undefined;
++    footer(facts: {
++      runId: string;
++      sessionId: string;
++      usageState?: import("openclaw/plugin-sdk/channel-outbound").TurnDisplayEvent["usageState"];
++    }): string | undefined;
++    freeze(): void;
++    close(): void;
++  };
+   verboseProgressActive: () => boolean;
+   previewLifecycle: LivePreviewLifecycle<ReplyPayload, number>;
+   progressCompositor: TelegramProgressCompositor;
+diff --git a/src/auto-reply/get-reply-options.types.ts b/src/auto-reply/get-reply-options.types.ts
+index 899fe65a..e432095f 100644
+--- a/src/auto-reply/get-reply-options.types.ts
++++ b/src/auto-reply/get-reply-options.types.ts
+@@ -172,6 +172,20 @@ export type GetReplyOptions = {
+     options?: ReplyDispatchRun,
+   ) => unknown;
+   /** Reports the terminal agent-run classification to the shared dispatch owner. */
++  /** Display-only channel seam, called with the exact native admitted execution identity. */
++  onTurnDisplayStart?: (identity: { runId: string; sessionId: string }) => void;
++  /** Public typed summary with producer sequence; no tool arguments/results. */
++  onTurnDisplayTool?: (facts: {
++    runId: string;
++    sessionId: string;
++    event: Omit<import("../channels/turn-display-extensions.js").OrdinaryToolSummary, "seq">;
++  }) => object | undefined;
++  /** Replace the generated usage suffix only, before rendering/paging/dedupe. */
++  onFinalUsageFooter?: (facts: {
++    runId: string;
++    sessionId: string;
++    usageState?: import("../plugins/hook-types.js").PluginHookReplyUsageState;
++  }) => string | undefined;
+   onAgentRunTerminalOutcome?: (outcome: "completed" | "failed") => void;
+   /** Reports visible work sessions this agent run spawned, in acceptance order. */
+   onVisibleWorkSessions?: (sessions: readonly VisibleWorkSession[]) => void;
+@@ -280,6 +294,8 @@ export type GetReplyOptions = {
+   }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
+   /** Called when a concrete work item starts, updates, or completes. */
+   onItemEvent?: (payload: {
++    /** Host-minted display handoff; no message authority. Never serialized. */
++    turnDisplayProjection?: object;
+     itemId?: string;
+     toolCallId?: string;
+     kind?: string;
+diff --git a/src/auto-reply/reply/agent-runner-embedded-candidate.ts b/src/auto-reply/reply/agent-runner-embedded-candidate.ts
+index 13b34bf0..5976b5b4 100644
+--- a/src/auto-reply/reply/agent-runner-embedded-candidate.ts
++++ b/src/auto-reply/reply/agent-runner-embedded-candidate.ts
+@@ -288,6 +288,7 @@ export async function runEmbeddedFallbackCandidate(
+             provider: params.provider,
+             model: params.model,
+             effectiveSessionId: params.effectiveRun.sessionId,
++            displayRunId: params.runId,
+             notifyUserAboutCompaction: params.notifyUserAboutCompaction,
+             onCompactionCompleted: () => {
+               attemptCompactionCount += 1;
+diff --git a/src/auto-reply/reply/agent-runner-event-handler.ts b/src/auto-reply/reply/agent-runner-event-handler.ts
+index 056e1f26..77944caf 100644
+--- a/src/auto-reply/reply/agent-runner-event-handler.ts
++++ b/src/auto-reply/reply/agent-runner-event-handler.ts
+@@ -36,6 +36,7 @@ export function createAgentRunEventHandler(params: {
+   provider: string;
+   model: string;
+   effectiveSessionId?: string;
++  displayRunId?: string;
+   notifyUserAboutCompaction: boolean;
+   onCompactionCompleted: () => number;
+   messageToolDeliveryState: MessageToolDeliveryState;
+@@ -133,7 +134,35 @@ export function createAgentRunEventHandler(params: {
+         typeof evt.data.commandBearing === "boolean" ? evt.data.commandBearing : undefined;
+       const itemApprovalId = readStringValue(evt.data.approvalId);
+       const itemApprovalSlug = readStringValue(evt.data.approvalSlug);
++      let turnDisplayProjection: object | undefined;
++      if (
++        readStringValue(evt.data.kind) === "tool" &&
++        itemToolCallId &&
++        itemName &&
++        evt.data.hideFromChannelProgress !== true &&
++        evt.data.suppressChannelProgress !== true &&
++        !itemApprovalId &&
++        (itemPhase === "start" || itemPhase === "update" || itemPhase === "end") &&
++        (itemStatus === "running" ||
++          itemStatus === "waiting" ||
++          itemStatus === "completed" ||
++          itemStatus === "failed" ||
++          itemStatus === "cancelled")
++      ) {
++        if (params.displayRunId && params.effectiveSessionId)
++          {turnDisplayProjection = params.turn.opts?.onTurnDisplayTool?.({
++            runId: params.displayRunId,
++            sessionId: params.effectiveSessionId,
++            event: {
++              callId: itemToolCallId,
++              toolName: itemName,
++              phase: itemPhase === "update" ? "status" : itemPhase,
++              status: itemStatus,
++            },
++          });}
++      }
+       await params.turn.opts?.onItemEvent?.({
++        ...(turnDisplayProjection ? { turnDisplayProjection } : {}),
+         itemId: readStringValue(evt.data.itemId),
+         kind: readStringValue(evt.data.kind),
+         title: readStringValue(evt.data.title),
+diff --git a/src/auto-reply/reply/agent-runner-execution.ts b/src/auto-reply/reply/agent-runner-execution.ts
+index 61a97236..bc528c5d 100644
+--- a/src/auto-reply/reply/agent-runner-execution.ts
++++ b/src/auto-reply/reply/agent-runner-execution.ts
+@@ -237,6 +237,7 @@ async function executeAgentTurnInternalLoop(
+     if (params.replyOperation) {
+       markReplyOperationExecutionStarted(params.replyOperation);
+     }
++    params.opts?.onTurnDisplayStart?.({ runId, sessionId: params.followupRun.run.sessionId });
+     params.opts?.onAgentRunStart?.(runId, admittedRunContext.current?.executionIdentityToken);
+   };
+   const signalExecutionPhaseForTyping = (
+diff --git a/src/auto-reply/reply/agent-runner-result-complete.ts b/src/auto-reply/reply/agent-runner-result-complete.ts
+index 723fa1b8..252ebba5 100644
+--- a/src/auto-reply/reply/agent-runner-result-complete.ts
++++ b/src/auto-reply/reply/agent-runner-result-complete.ts
+@@ -124,8 +124,58 @@ export async function completeReplyAgentRun(input: {
+   if (trailingPluginStatusPayload) {
+     finalPayloads = [...finalPayloads, trailingPluginStatusPayload];
+   }
+-  if (responseUsageLine) {
+-    finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
++  let finalUsageLine = responseUsageLine;
++  let customUsageLine: string | undefined;
++  const hasFinalText = guardedReplyPayloads.some(
++    (payload) =>
++      Boolean(payload.text?.trim()) &&
++      !payload.isError &&
++      !payload.isStatusNotice &&
++      !payload.isReasoning,
++  );
++  if (
++    hasFinalText &&
++    !runResult.meta?.error &&
++    runResult.meta?.aborted !== true &&
++    runResult.meta?.yielded !== true &&
++    !accounting.fallbackExhausted &&
++    !accounting.preserveUserFacingSessionState &&
++    !isHeartbeat &&
++    !opts?.abortSignal?.aborted
++  ) {
++    try {
++      customUsageLine = opts?.onFinalUsageFooter?.({
++        runId: accounting.runId,
++        sessionId: followupRun.run.sessionId,
++        usageState: accounting.replyUsageState,
++      });
++      // The extension returns literal display text, not authored Markdown/HTML.
++      // Escape its syntax before the existing Telegram renderer owns chunking.
++      if (customUsageLine) {
++        customUsageLine = customUsageLine.replace(/[\\`*_{}[\]<>#|!]/gu, "\\$&");
++      }
++      finalUsageLine = customUsageLine ?? responseUsageLine;
++    } catch {
++      /* A display formatter cannot fail delivery; retain native usage. */
++    }
++  }
++  if (customUsageLine) {
++    const index = finalPayloads.findLastIndex(
++      (payload) =>
++        Boolean(payload.text?.trim()) &&
++        !payload.isError &&
++        !payload.isStatusNotice &&
++        !payload.isReasoning,
++    );
++    if (index >= 0) {
++      finalPayloads = [
++        ...finalPayloads.slice(0, index),
++        ...appendUsageLine([finalPayloads[index]!], customUsageLine),
++        ...finalPayloads.slice(index + 1),
++      ];
++    }
++  } else if (finalUsageLine) {
++    finalPayloads = appendUsageLine(finalPayloads, finalUsageLine);
+   }
+   if (isHookBlockedRun) {
+     finalPayloads = markBeforeAgentRunBlockedPayloads(finalPayloads);
+diff --git a/src/channels/progress-draft-compositor.ts b/src/channels/progress-draft-compositor.ts
+index a8be718d..d6320d06 100644
+--- a/src/channels/progress-draft-compositor.ts
++++ b/src/channels/progress-draft-compositor.ts
+@@ -464,6 +464,26 @@ export function createChannelProgressDraftCompositor(params: ChannelProgressDraf
+     },
+     getSnapshot,
+     getText: () => formatDraftText(),
++    /** Host replaces ordinary rows only; attention/reasoning/commentary/plan remain native. */
++    async replaceOrdinaryToolLines(
++      rows: readonly { category: string; status: string; text: string }[],
++    ) {
++      if (!isTurnActive() || progressSuppressed || !previewToolProgressEnabled) {return false;}
++      lines = [
++        ...lines.filter(
++          (line) => typeof line === "string" || !line.id?.startsWith("compact-tool:"),
++        ),
++        ...rows.map((row) => ({
++          id: `compact-tool:${row.category}`,
++          kind: "item" as const,
++          label: row.text,
++          text: row.text,
++          toolName: row.category,
++          prefix: false as const,
++        })),
++      ];
++      return params.mode === "progress" ? await startAndRender() : await publish();
++    },
+     markFinalReplyStarted() {
+       finalReplyStarted = true;
+       // Final delivery must disarm the delayed start before async delivery work.
+diff --git a/src/channels/turn-display-extensions.test.ts b/src/channels/turn-display-extensions.test.ts
+new file mode 100644
+index 00000000..33dc0f94
+--- /dev/null
++++ b/src/channels/turn-display-extensions.test.ts
+@@ -0,0 +1,219 @@
++import { afterEach, describe, expect, it } from "vitest";
++import { registerFooterPlugin } from "../../test/fixtures/turn-display-plugins/footer/registration.js";
++import { registerProgressPlugin } from "../../test/fixtures/turn-display-plugins/progress/registration.mjs";
++import { pluginFixture } from "../../test/fixtures/turn-display-plugins/registry.js";
++import type { PluginInstanceHandle } from "../plugins/plugin-instance-scope.js";
++import { createLivePreviewLifecycle } from "./message/live.js";
++import { createChannelProgressDraftCompositor } from "./progress-draft-compositor.js";
++import { createTurnDisplayLease, type TurnDisplayCapabilityV1 } from "./turn-display-extensions.js";
++
++const instances: PluginInstanceHandle[] = [];
++afterEach(async () => {
++  for (const instance of instances.splice(0)) await instance.dispose();
++});
++const scope = {
++  channel: "telegram" as const,
++  accountId: "a",
++  conversationId: "c",
++  threadId: null,
++  sessionKey: "key",
++  sessionId: "session",
++  runId: "run",
++};
++const stats = { usage: { input: 120, output: 30, total: 150 }, durationMs: 1000 };
++function load(id: string, mode = {}, activate = true) {
++  const fixture = pluginFixture(id, mode, activate);
++  instances.push(fixture.instance);
++  return fixture;
++}
++describe("host-owned instance-bound display capabilities", () => {
++  it("refuses pluginId self-assertion and raw registry overwrite", () => {
++    const fixture = load("attacker");
++    const capability = fixture.api.runtime.channel.runtimeContexts.get<TurnDisplayCapabilityV1>({
++      channelId: "telegram",
++      capability: "finalUsageFooter.v1",
++    })!;
++    expect(() =>
++      capability.register({
++        pluginId: "token-speed-footer",
++        signal: new AbortController().signal,
++        onLifecycle: () => "forged",
++      }),
++    ).toThrow("plugin instance");
++    expect(() =>
++      fixture.runtime.channel.runtimeContexts.register({
++        channelId: "telegram",
++        capability: "finalUsageFooter.v1",
++        context: { register: () => {} },
++      }),
++    ).toThrow("host-owned");
++  });
++  it("stages a replacement registration before commit and selects the published generation", async () => {
++    const old = load("token-speed-footer", { deliveryMode: "preview-safe" });
++    registerFooterPlugin(old.api);
++    const oldLease = createTurnDisplayLease({ ...scope, runId: "old" });
++    const candidate = load(
++      "token-speed-footer",
++      { deliveryMode: "preview-safe", footerPrefix: "NEXT" },
++      false,
++    );
++    expect(() => registerFooterPlugin(candidate.api)).not.toThrow();
++    expect(oldLease.finalize(stats)).toContain("总计 150");
++    const beforeCommit = createTurnDisplayLease({ ...scope, runId: "precommit" });
++    expect(beforeCommit.finalize(stats)).toContain("🧮 用量");
++    beforeCommit.close();
++    const { quiescePluginRegistry, markPluginRegistryActive } =
++      await import("../plugins/registry-lifecycle.js");
++    quiescePluginRegistry(old.builder.registry);
++    markPluginRegistryActive(candidate.builder.registry);
++    const newLease = createTurnDisplayLease({ ...scope, runId: "new" });
++    expect(newLease.finalize(stats)).toContain("NEXT 用量");
++    oldLease.close();
++    newLease.close();
++  });
++  it("isolates account/topic/session/run leases and fences duplicates, cancellation, abort and reload", async () => {
++    const fixture = load("token-speed-footer", { deliveryMode: "preview-safe" });
++    registerFooterPlugin(fixture.api);
++    const one = createTurnDisplayLease(scope);
++    const two = createTurnDisplayLease({
++      ...scope,
++      accountId: "other",
++      threadId: "42",
++      sessionId: "other",
++      runId: "other",
++    });
++    expect(one.finalize(stats)).toContain("总计 150");
++    expect(one.finalize(stats)).toBeUndefined();
++    expect(two.finalize({ usage: { output: 70 } })).toContain("输出 70");
++    const controller = new AbortController();
++    const aborted = createTurnDisplayLease(scope, controller.signal);
++    controller.abort();
++    expect(aborted.finalize(stats)).toBeUndefined();
++    const retained = createTurnDisplayLease(scope);
++    await fixture.instance.drain();
++    expect(retained.finalize(stats)).toBeUndefined();
++    const replacement = load("token-speed-footer", { deliveryMode: "preview-safe" });
++    registerFooterPlugin(replacement.api);
++    expect(retained.finalize(stats)).toBeUndefined();
++    const fresh = createTurnDisplayLease({ ...scope, runId: "fresh" });
++    expect(fresh.finalize(stats)).toContain("总计 150");
++    one.close();
++    two.close();
++    retained.close();
++    fresh.close();
++  });
++  it("fails closed on malformed plugin display output", () => {
++    const footer = load("token-speed-footer");
++    const footerCapability =
++      footer.api.runtime.channel.runtimeContexts.get<TurnDisplayCapabilityV1>({
++        channelId: "telegram",
++        capability: "finalUsageFooter.v1",
++      });
++    footerCapability!.register({
++      pluginId: "token-speed-footer",
++      signal: footer.instance.lifecycle.signal,
++      onLifecycle: () => "\u0001".repeat(1025),
++    });
++    expect(createTurnDisplayLease(scope).finalize(stats)).toBeUndefined();
++    const progress = load("compact-telegram-progress");
++    const progressCapability =
++      progress.api.runtime.channel.runtimeContexts.get<TurnDisplayCapabilityV1>({
++        channelId: "telegram",
++        capability: "ordinaryToolProgress.v1",
++      });
++    progressCapability!.register({
++      pluginId: "compact-telegram-progress",
++      signal: progress.instance.lifecycle.signal,
++      onLifecycle: () => [
++        { category: "Read", status: "running", text: "ok" },
++        { category: "Read", status: "completed", text: "duplicate" },
++      ],
++    });
++    expect(
++      createTurnDisplayLease(scope).progress({
++        callId: "c",
++        toolName: "read",
++        phase: "start",
++        status: "running",
++        seq: 1,
++      }),
++    ).toBeUndefined();
++  });
++
++  it("keeps three category rows, superseded calls, native plan/headline and attention lanes", async () => {
++    const fixture = load("compact-telegram-progress");
++    registerProgressPlugin(fixture.api);
++    const lease = createTurnDisplayLease(scope);
++    const snapshots: unknown[] = [];
++    const compositor = createChannelProgressDraftCompositor({
++      active: true,
++      mode: "progress",
++      seed: "fixture",
++      entry: { streaming: { mode: "progress", progress: { toolProgress: true, maxLines: 12 } } },
++      update: (_text, options) => {
++        snapshots.push(options.snapshot);
++      },
++      preparedItems: true,
++    });
++    let seq = 0;
++    const update = async (
++      callId: string,
++      toolName: string,
++      phase: "start" | "end",
++      status: "running" | "completed" = "running",
++    ) => {
++      const rows = lease.progress({ callId, toolName, phase, status, seq: ++seq });
++      if (rows) await compositor.replaceOrdinaryToolLines(rows);
++    };
++    await compositor.pushPlanProgress([{ step: "Keep plan", status: "in_progress" }]);
++    await compositor.pushPreambleHeadline("Keep headline", { itemId: "headline" });
++    await compositor.pushApprovalEvent({
++      approvalId: "approval-1",
++      phase: "requested",
++      title: "Keep approval",
++    });
++    await update("old", "read", "start");
++    await update("new", "read", "start");
++    await update("exec", "exec", "start");
++    await update("search", "web_search", "start");
++    await update("write", "write", "start");
++    const before = compositor.getSnapshot();
++    await update("old", "read", "end", "completed");
++    expect(compositor.getSnapshot().lines).toEqual(before.lines);
++    await update("new", "read", "end", "completed");
++    const snapshot = compositor.getSnapshot();
++    const categories = snapshot.lines.filter(
++      (line) => typeof line !== "string" && line.id?.startsWith("compact-tool:"),
++    );
++    expect(categories).toHaveLength(3);
++    expect(categories.map((line) => typeof line !== "string" && line.id)).toEqual([
++      "compact-tool:Search",
++      "compact-tool:Write",
++      "compact-tool:Read",
++    ]);
++    expect(
++      snapshot.lines.some((line) => typeof line !== "string" && line.kind === "approval"),
++    ).toBe(true);
++    expect(snapshot.plan?.[0].step).toBe("Keep plan");
++    expect(snapshot.statusHeadline).toBe("Keep headline");
++    const nativeLifecycle = createLivePreviewLifecycle({
++      onFinalStarted: () => compositor.markFinalReplyStarted(),
++    });
++    nativeLifecycle.beginFinalDelivery();
++    const frozen = compositor.getSnapshot();
++    await update("late", "exec", "start");
++    expect(compositor.getSnapshot()).toEqual(frozen);
++    lease.close("failed");
++    expect(
++      lease.progress({
++        callId: "late2",
++        toolName: "read",
++        phase: "start",
++        status: "running",
++        seq: ++seq,
++      }),
++    ).toBeUndefined();
++    compositor.cancel();
++    expect(snapshots.length).toBeGreaterThan(0);
++  });
++});
+diff --git a/src/channels/turn-display-extensions.ts b/src/channels/turn-display-extensions.ts
+new file mode 100644
+index 00000000..bc755f7b
+--- /dev/null
++++ b/src/channels/turn-display-extensions.ts
+@@ -0,0 +1,295 @@
++import type { PluginHookReplyUsageState } from "../plugins/hook-types.js";
++import type { PluginInstanceHandle } from "../plugins/plugin-instance-scope.js";
++import { isPluginRecordActive } from "../plugins/registry-lifecycle.js";
++import { resolveGlobalMap } from "../shared/global-singleton.js";
++import type { ChannelRuntimeContextRegistry } from "./plugins/channel-runtime-surface.types.js";
++
++export type TurnDisplayScope = Readonly<{
++  channel: "telegram";
++  accountId: string;
++  sessionKey: string;
++  sessionId: string;
++  runId: string;
++  conversationId: string;
++  threadId: string | null;
++}>;
++export type OrdinaryToolSummary = Readonly<{
++  callId: string;
++  toolName: string;
++  seq: number;
++  phase: "start" | "status" | "end";
++  status: "running" | "waiting" | "completed" | "failed" | "cancelled";
++}>;
++export type TurnDisplayEvent = Readonly<{
++  lease: object;
++  scope: TurnDisplayScope;
++  signal?: AbortSignal;
++  replay: false;
++  phase: "begin" | "finalize" | "progress" | "cancel" | "failed" | "settled";
++  status?: "completed";
++  usageScope?: "turn-aggregate";
++  usageState?: PluginHookReplyUsageState;
++  target?: "final-text";
++  pagination?: "before-chunking";
++  event?: OrdinaryToolSummary;
++}>;
++export type OrdinaryToolRow = Readonly<{ category: string; status: string; text: string }>;
++export type TurnDisplayCapabilityV1 = Readonly<{
++  version: 1;
++  register(params: {
++    pluginId: string;
++    signal: AbortSignal;
++    onLifecycle: (event: TurnDisplayEvent) => string | readonly OrdinaryToolRow[] | undefined;
++  }): { dispose(): void };
++}>;
++const approvedOwners = new Map([
++  ["finalUsageFooter.v1", "token-speed-footer"],
++  ["ordinaryToolProgress.v1", "compact-telegram-progress"],
++]);
++type Registration = {
++  instance: PluginInstanceHandle;
++  signal: AbortSignal;
++  invoke: (event: TurnDisplayEvent) => string | readonly OrdinaryToolRow[] | undefined;
++  dispose(): void;
++};
++const registrations = resolveGlobalMap<string, Set<Registration>>(
++  Symbol.for("openclaw.turnDisplayExtensions.v1"),
++  (entries) => {
++    for (const owners of entries.values()) {
++      for (const entry of owners) {
++        entry.dispose();
++      }
++    }
++    entries.clear();
++  },
++  "plugin-registry",
++);
++export function isTurnDisplayCapability(channelId: string, capability: string): boolean {
++  return channelId === "telegram" && approvedOwners.has(capability);
++}
++
++function isSafeDisplayText(value: unknown, maxLength: number): value is string {
++  if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
++    return false;
++  }
++  for (const char of value) {
++    const code = char.codePointAt(0) ?? 0;
++    if (
++      (code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) ||
++      code === 0x7f ||
++      (code >= 0x202a && code <= 0x202e) ||
++      (code >= 0x2066 && code <= 0x2069)
++    ) {
++      return false;
++    }
++  }
++  return true;
++}
++
++function validateOrdinaryRows(value: unknown): readonly OrdinaryToolRow[] | undefined {
++  if (!Array.isArray(value) || value.length > 3) {
++    return undefined;
++  }
++  const categories = new Set<string>();
++  const rows: OrdinaryToolRow[] = [];
++  for (const row of value) {
++    if (!row || typeof row !== "object") {
++      return undefined;
++    }
++    const candidate = row as Record<string, unknown>;
++    if (
++      !isSafeDisplayText(candidate.category, 64) ||
++      !isSafeDisplayText(candidate.status, 32) ||
++      !isSafeDisplayText(candidate.text, 200) ||
++      /[\r\n]/u.test(candidate.text) ||
++      !["Read", "Exec", "Search", "Write", "Fetch", "Browser", "Delegate", "Other"].includes(
++        candidate.category,
++      ) ||
++      !["running", "waiting", "completed", "failed", "cancelled"].includes(candidate.status) ||
++      categories.has(candidate.category)
++    ) {
++      return undefined;
++    }
++    categories.add(candidate.category);
++    rows.push({ category: candidate.category, status: candidate.status, text: candidate.text });
++  }
++  return rows;
++}
++/** Loader supplies the actual instance; pluginId in register is only a consistency check. */
++export function bindTurnDisplayContexts(
++  base: ChannelRuntimeContextRegistry,
++  instance: PluginInstanceHandle,
++): ChannelRuntimeContextRegistry {
++  return {
++    ...base,
++    // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Caller-selected key typing, matching the base registry.
++    get: <T>(key: Parameters<ChannelRuntimeContextRegistry["get"]>[0]): T | undefined => {
++      if (!isTurnDisplayCapability(key.channelId, key.capability)) {
++        return base.get<T>(key);
++      }
++      const capability: TurnDisplayCapabilityV1 = {
++        version: 1,
++        register(params) {
++          if (
++            instance.pluginId !== approvedOwners.get(key.capability) ||
++            params.pluginId !== instance.pluginId ||
++            params.signal.aborted ||
++            instance.lifecycle.signal.aborted ||
++            !instance.acceptingCalls ||
++            instance.owner?.revoked
++          ) {
++            throw new Error("Turn display registration requires its approved live plugin instance");
++          }
++          const owners = registrations.get(key.capability) ?? new Set<Registration>();
++          if ([...owners].some((owner) => owner.instance === instance)) {
++            throw new Error("Turn display owner already registered for this plugin instance");
++          }
++          let disposed = false;
++          const dispose = () => {
++            if (disposed) {
++              return;
++            }
++            disposed = true;
++            params.signal.removeEventListener("abort", dispose);
++            instance.lifecycle.signal.removeEventListener("abort", dispose);
++            removeCleanup();
++            const currentOwners = registrations.get(key.capability);
++            if (currentOwners?.delete(registration) && currentOwners.size === 0) {
++              registrations.delete(key.capability);
++            }
++          };
++          const registration: Registration = {
++            instance,
++            signal: params.signal,
++            dispose,
++            invoke: (event) => {
++              if (
++                disposed ||
++                params.signal.aborted ||
++                instance.lifecycle.signal.aborted ||
++                !instance.acceptingCalls ||
++                instance.replacementPending ||
++                instance.owner?.revoked
++              ) {
++                return undefined;
++              }
++              try {
++                return instance.runConsumer(() => params.onLifecycle(event));
++              } catch {
++                return undefined;
++              }
++            },
++          };
++          const removeCleanup = instance.lifecycle.onDispose(dispose);
++          params.signal.addEventListener("abort", dispose, { once: true });
++          instance.lifecycle.signal.addEventListener("abort", dispose, { once: true });
++          owners.add(registration);
++          registrations.set(key.capability, owners);
++          return { dispose };
++        },
++      };
++      // Runtime contexts are typed by the caller-selected key, as in the base registry.
++      return capability as T;
++    },
++  };
++}
++
++/** Created only by the already-admitted channel turn. No transport or message handle escapes. */
++export function createTurnDisplayLease(scope: TurnDisplayScope, signal?: AbortSignal) {
++  const lease = Object.freeze({});
++  const base = { lease, scope: Object.freeze({ ...scope }), signal, replay: false as const };
++  // Snapshot only the currently published owner generation. Replacement plugin
++  // modules register while the old generation is draining; they are not visible
++  // until the registry marks their exact record active.
++  const owners = new Map<string, Registration>();
++  for (const [capability, candidates] of registrations) {
++    const active = [...candidates].filter((candidate) => {
++      const owner = candidate.instance.owner;
++      return owner !== undefined && isPluginRecordActive(owner.registry, owner.record);
++    });
++    if (active.length === 1) {
++      owners.set(capability, active[0]!);
++    }
++  }
++  let closed = false;
++  let finalized = false;
++  let progressFrozen = false;
++  const emit = (
++    capability: string,
++    event: TurnDisplayEvent,
++  ): string | readonly OrdinaryToolRow[] | undefined => {
++    const owner = owners.get(capability);
++    return owner && registrations.get(capability)?.has(owner) ? owner.invoke(event) : undefined;
++  };
++  for (const key of owners.keys()) {
++    emit(key, { ...base, phase: "begin" });
++  }
++  const close = (phase: "cancel" | "failed" | "settled" = "settled") => {
++    if (closed) {
++      return;
++    }
++    closed = true;
++    signal?.removeEventListener("abort", cancel);
++    for (const key of owners.keys()) {
++      emit(key, { ...base, phase });
++    }
++  };
++  const cancel = () => close("cancel");
++  signal?.addEventListener("abort", cancel, { once: true });
++  if (signal?.aborted) {
++    cancel();
++  }
++  return {
++    close,
++    isProgressActive() {
++      const owner = owners.get("ordinaryToolProgress.v1");
++      const instance = owner?.instance;
++      return (
++        !closed &&
++        !finalized &&
++        !progressFrozen &&
++        !signal?.aborted &&
++        owner !== undefined &&
++        registrations.get("ordinaryToolProgress.v1")?.has(owner) === true &&
++        !owner.signal.aborted &&
++        instance?.acceptingCalls === true &&
++        !instance.replacementPending &&
++        !instance.lifecycle.signal.aborted &&
++        instance.owner !== undefined &&
++        isPluginRecordActive(instance.owner.registry, instance.owner.record)
++      );
++    },
++    freezeProgress() {
++      progressFrozen = true;
++    },
++    finalize(usageState?: PluginHookReplyUsageState): string | undefined {
++      if (closed || finalized || signal?.aborted) {
++        return undefined;
++      }
++      finalized = true;
++      const value = emit("finalUsageFooter.v1", {
++        ...base,
++        phase: "finalize",
++        status: "completed",
++        usageScope: "turn-aggregate",
++        usageState,
++        target: "final-text",
++        pagination: "before-chunking",
++      });
++      // UTF-16 bounded before rendering. Telegram retains escaping, paging and transport custody.
++      return isSafeDisplayText(value, 1024) ? value : undefined;
++    },
++    progress(event: OrdinaryToolSummary): readonly OrdinaryToolRow[] | undefined {
++      if (closed || finalized || progressFrozen || signal?.aborted) {
++        return undefined;
++      }
++      const value = emit("ordinaryToolProgress.v1", { ...base, phase: "progress", event });
++      try {
++        return validateOrdinaryRows(value);
++      } catch {
++        return undefined;
++      }
++    },
++  };
++}
++export type TurnDisplayLease = ReturnType<typeof createTurnDisplayLease>;
+diff --git a/src/plugin-sdk/channel-outbound.ts b/src/plugin-sdk/channel-outbound.ts
+index 94d91d19..b59f82da 100644
+--- a/src/plugin-sdk/channel-outbound.ts
++++ b/src/plugin-sdk/channel-outbound.ts
+@@ -14,6 +14,15 @@ import { preserveReplyPayloadMediaSelectionCore } from "../infra/outbound/reply-
+ import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+ import type { ReplyPayload } from "./reply-payload.js";
+ 
++export { createTurnDisplayLease } from "../channels/turn-display-extensions.js";
++export type {
++  TurnDisplayLease,
++  TurnDisplayScope,
++  TurnDisplayCapabilityV1,
++  TurnDisplayEvent,
++  OrdinaryToolSummary,
++} from "../channels/turn-display-extensions.js";
++
+ export { isCompleteAgentPreamble } from "../agents/agent-activity-presentation.js";
+ 
+ type ChannelDurableDeliveryModule = typeof import("../channels/turn/durable-delivery.js");
+diff --git a/src/plugins/api-facades.ts b/src/plugins/api-facades.ts
+index da02a3d7..599d27bb 100644
+--- a/src/plugins/api-facades.ts
++++ b/src/plugins/api-facades.ts
+@@ -1,3 +1,4 @@
++import { bindTurnDisplayContexts } from "../channels/turn-display-extensions.js";
+ import { bindPluginCliProgram } from "./cli-callback-binding.js";
+ import { pluginInstanceState, type PluginInstanceHandle } from "./plugin-instance-scope.js";
+ import type { OpenClawPluginCliRegistrar } from "./plugin-registration.types.js";
+@@ -81,6 +82,18 @@ export function instrumentPluginInstanceApi(
+     return api;
+   }
+   api.lifecycle = { ...api.lifecycle, ...instance.lifecycle };
++  const runtime = api.runtime;
++  let channel: OpenClawPluginApi["runtime"]["channel"] | undefined;
++  api.runtime = new Proxy(runtime, {
++    get(target, key, receiver) {
++      if (key !== "channel") {return Reflect.get(target, key, receiver);}
++      channel ??= {
++        ...runtime.channel,
++        runtimeContexts: bindTurnDisplayContexts(runtime.channel.runtimeContexts, instance),
++      };
++      return channel;
++    },
++  });
+   const instrumented = attachPluginApiFacades(
+     new Proxy(api, {
+       get: (target, key, receiver) => {
+diff --git a/src/plugins/runtime/channel-runtime-contexts.ts b/src/plugins/runtime/channel-runtime-contexts.ts
+index 992ce249..2cbb0fc7 100644
+--- a/src/plugins/runtime/channel-runtime-contexts.ts
++++ b/src/plugins/runtime/channel-runtime-contexts.ts
+@@ -4,6 +4,7 @@ import type {
+   ChannelRuntimeContextKey,
+   ChannelRuntimeContextRegistry,
+ } from "../../channels/plugins/channel-runtime-surface.types.js";
++import { isTurnDisplayCapability } from "../../channels/turn-display-extensions.js";
+ import { createSubsystemLogger } from "../../logging.js";
+ 
+ type StoredRuntimeContext = {
+@@ -69,6 +70,17 @@ export function createChannelRuntimeContextRegistry(): ChannelRuntimeContextRegi
+   return {
+     register: (params) => {
+       const normalized = normalizeRuntimeContextKey(params);
++      if (
++        normalized &&
++        isTurnDisplayCapability(
++          normalized.normalizedKey.channelId,
++          normalized.normalizedKey.capability,
++        )
++      ) {
++        throw new Error(
++          "Turn display capability is host-owned; registration requires a plugin-instance binding",
++        );
++      }
+       if (!normalized || params.abortSignal?.aborted) {
+         return { dispose: () => {} };
+       }
+diff --git a/test/fixtures/turn-display-plugins/footer/footer.js b/test/fixtures/turn-display-plugins/footer/footer.js
+new file mode 100644
+index 00000000..92521ef9
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/footer/footer.js
+@@ -0,0 +1,114 @@
++/**
++ * Pure formatting logic for the OpenClaw reply_payload_sending hook.
++ *
++ * The usage object is deliberately treated as opaque normalized host data:
++ * this module never estimates tokens from text and never calls a provider.
++ */
++
++const DEFAULTS = Object.freeze({
++  enabled: true,
++  showInput: true,
++  showOutput: true,
++  showCache: true,
++  showTotal: true,
++  showSpeed: true,
++  showDuration: true,
++  showModel: false,
++  footerPrefix: "🧮",
++});
++
++function finiteNonNegative(value) {
++  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
++}
++
++function integer(value) {
++  const n = finiteNonNegative(value);
++  return n === undefined ? undefined : Math.round(n);
++}
++
++function numberWithThousands(value) {
++  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
++}
++
++function seconds(valueMs) {
++  return (valueMs / 1000).toFixed(valueMs >= 10_000 ? 1 : 2);
++}
++
++function normalizeOptions(options = {}) {
++  const out = { ...DEFAULTS };
++  for (const key of Object.keys(DEFAULTS)) {
++    if (typeof options[key] === typeof DEFAULTS[key]) out[key] = options[key];
++  }
++  if (out.footerPrefix.trim() === "") out.footerPrefix = DEFAULTS.footerPrefix;
++  return out;
++}
++
++/**
++ * Format only values supplied by OpenClaw's official usageState.
++ * Returns undefined when no trustworthy usage value is available.
++ */
++export function formatUsageFooter(usageState, options = {}) {
++  const opts = normalizeOptions(options);
++  if (!opts.enabled || !usageState || typeof usageState !== "object") return undefined;
++
++  const usage = usageState.usage && typeof usageState.usage === "object" ? usageState.usage : undefined;
++  if (!usage) return undefined;
++
++  const input = integer(usage.input);
++  const output = integer(usage.output);
++  const cacheRead = integer(usage.cacheRead);
++  const cacheWrite = integer(usage.cacheWrite);
++  const total = integer(usage.total);
++  const durationMs = finiteNonNegative(usageState.durationMs);
++
++  // Do not emit a decorative footer for a delivery that has no exact host usage.
++  if ([input, output, cacheRead, cacheWrite, total].every((v) => v === undefined)) return undefined;
++
++  const parts = [];
++  if (opts.showInput && input !== undefined) parts.push(`输入 ${numberWithThousands(input)}`);
++  if (opts.showOutput && output !== undefined) parts.push(`输出 ${numberWithThousands(output)}`);
++  if (opts.showCache && cacheRead !== undefined) parts.push(`缓存读取 ${numberWithThousands(cacheRead)}`);
++  if (opts.showCache && cacheWrite !== undefined) parts.push(`缓存写入 ${numberWithThousands(cacheWrite)}`);
++  if (opts.showTotal && total !== undefined) parts.push(`总计 ${numberWithThousands(total)}`);
++
++  // This is provably output tokens divided by OpenClaw's turn wall duration.
++  // It is intentionally labelled "turn wall" rather than provider generation speed.
++  if (opts.showSpeed && output !== undefined && durationMs !== undefined && durationMs > 0) {
++    const rate = output / (durationMs / 1000);
++    parts.push(`输出速度 ${rate.toFixed(rate >= 100 ? 0 : 1)} token/秒（回合耗时）`);
++  }
++  if (opts.showDuration && durationMs !== undefined) parts.push(`回合耗时 ${seconds(durationMs)}秒`);
++  if (opts.showModel && typeof usageState.resolvedRef === "string" && usageState.resolvedRef.length > 0) {
++    parts.push(usageState.resolvedRef);
++  }
++
++  if (parts.length === 0) return undefined;
++  return `${opts.footerPrefix} 用量：${parts.join(" · ")}`;
++}
++
++/**
++ * Append once to a text-bearing payload while retaining every other field.
++ */
++export function appendUsageFooter(payload, footer) {
++  if (!footer || !payload || typeof payload !== "object") return payload;
++  const marker = footer.slice(0, Math.min(16, footer.length));
++  if (typeof payload.text === "string") {
++    if (payload.text.includes(marker)) return payload;
++    return { ...payload, text: `${payload.text}\n\n${footer}` };
++  }
++  if (payload.fallbackText && typeof payload.fallbackText.text === "string") {
++    if (payload.fallbackText.text.includes(marker)) return payload;
++    return {
++      ...payload,
++      fallbackText: { ...payload.fallbackText, text: `${payload.fallbackText.text}\n\n${footer}` },
++    };
++  }
++  return payload;
++}
++
++export function isTelegramFinalEvent(event, context) {
++  if (!event || event.kind !== "final") return false;
++  return event.channel === "telegram" || context?.channel === "telegram" || context?.messageProvider === "telegram";
++}
++
++export const DEFAULT_OPTIONS = DEFAULTS;
+diff --git a/test/fixtures/turn-display-plugins/footer/package.json b/test/fixtures/turn-display-plugins/footer/package.json
+new file mode 100644
+index 00000000..089153bc
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/footer/package.json
+@@ -0,0 +1 @@
++{"type":"module"}
+diff --git a/test/fixtures/turn-display-plugins/footer/preview-footer.js b/test/fixtures/turn-display-plugins/footer/preview-footer.js
+new file mode 100644
+index 00000000..8abf74f4
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/footer/preview-footer.js
+@@ -0,0 +1,65 @@
++import { formatUsageFooter } from "./footer.js";
++
++// PROPOSED host capability, NOT supplied by OpenClaw 2026.10.1. Transport stays
++// in core: this callback returns display text and cannot send/edit any message.
++export const PREVIEW_FOOTER_CAPABILITY = "finalUsageFooter.v1";
++
++const scopeFields = ["channel", "accountId", "sessionKey", "sessionId", "runId", "conversationId", "threadId"];
++function validScope(scope) {
++  return scope?.channel === "telegram"
++    && scopeFields.slice(1, -1).every((field) => typeof scope[field] === "string" && scope[field].length > 0)
++    && (scope.threadId === null || (typeof scope.threadId === "string" && scope.threadId.length > 0));
++}
++function sameScope(a, b) {
++  return validScope(b) && scopeFields.every((field) => a[field] === b[field]);
++}
++function object(value) {
++  return value !== null && typeof value === "object";
++}
++function copyScope(scope) {
++  return Object.freeze(Object.fromEntries(scopeFields.map((field) => [field, scope[field]])));
++}
++
++/**
++ * A host-minted lease is the identity, not a latest-run/chat heuristic.
++ * WeakMap keeps terminal tombstones for the lifetime of that lease without
++ * retaining transcripts, message text, credentials, or unbounded run IDs.
++ *
++ * begin -> finalize (at most once), or begin -> cancel/failed/settled.
++ * finalize is synchronous and pure; the HOST checks cancellation/revision again
++ * and owns footer replacement, chunking, draft finalization, retry, and receipts.
++ */
++export function createPreviewFooterFormatter(options = {}, { signal: pluginSignal } = {}) {
++  const leases = new WeakMap();
++  return function onLifecycle(event) {
++    if (pluginSignal?.aborted || !event || !object(event.lease)) return undefined;
++    const state = leases.get(event.lease);
++    if (event.phase === "begin") {
++      if (state || !validScope(event.scope)) return undefined;
++      leases.set(event.lease, {
++        scope: copyScope(event.scope),
++        signal: event.signal,
++        terminal: event.replay !== false || Boolean(event.signal?.aborted),
++      });
++      return undefined;
++    }
++    if (!state && validScope(event.scope) && ["finalize", "cancel", "failed", "settled"].includes(event.phase)) {
++      // Out-of-order terminal notification fences a subsequent late begin.
++      leases.set(event.lease, { scope: copyScope(event.scope), terminal: true });
++      return undefined;
++    }
++    if (!state || state.terminal || !sameScope(state.scope, event.scope)) return undefined;
++    if (["cancel", "failed", "settled"].includes(event.phase)) {
++      state.terminal = true;
++      return undefined;
++    }
++    if (event.phase !== "finalize") return undefined;
++    // Consume before formatting, including no-data/error finals: retries replay
++    // the host's durable prepared payload, not this callback a second time.
++    state.terminal = true;
++    if (state.signal?.aborted || event.signal?.aborted || event.replay !== false
++      || event.status !== "completed" || event.usageScope !== "turn-aggregate"
++      || event.target !== "final-text" || event.pagination !== "before-chunking") return undefined;
++    return formatUsageFooter(event.usageState, options);
++  };
++}
+diff --git a/test/fixtures/turn-display-plugins/footer/registration.js b/test/fixtures/turn-display-plugins/footer/registration.js
+new file mode 100644
+index 00000000..7365c65c
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/footer/registration.js
+@@ -0,0 +1,50 @@
++import { appendUsageFooter, formatUsageFooter, isTelegramFinalEvent } from "./footer.js";
++import { createPreviewFooterFormatter, PREVIEW_FOOTER_CAPABILITY } from "./preview-footer.js";
++
++/** Exported separately so registration can be tested without loading a Gateway. */
++export function registerFooterPlugin(api) {
++  const options = api.pluginConfig ?? {};
++  // A registered modifier suppresses native previews even if it returns nothing.
++  if (options.enabled === false) return;
++  if (options.deliveryMode === "preview-safe") {
++    const registry = api.runtime?.channel?.runtimeContexts;
++    const capability = registry?.get({ channelId: "telegram", capability: PREVIEW_FOOTER_CAPABILITY });
++    if (capability?.version !== 1 || typeof capability.register !== "function"
++      || typeof api.lifecycle?.onDispose !== "function" || !api.lifecycle.signal) {
++      api.logger.warn("preview-safe footer inactive: host finalUsageFooter.v1 capability unavailable; native preview/footer unchanged (no modifying hooks registered)");
++      return;
++    }
++    // No run takeover, arbitrary send/edit access, or Telegram credentials.
++    const controller = new AbortController();
++    const signal = AbortSignal.any([api.lifecycle.signal, controller.signal]);
++    let handle;
++    try {
++      handle = capability.register({
++        pluginId: "token-speed-footer", signal,
++        onLifecycle: createPreviewFooterFormatter(options, { signal }),
++      });
++      if (typeof handle?.dispose !== "function") throw new Error("missing disposal handle");
++      api.lifecycle.onDispose(() => { controller.abort(); return handle.dispose(); });
++    } catch {
++      controller.abort(); // fence even a partially registered malformed host
++      api.logger.warn("host finalUsageFooter.v1 registration failed; preview-safe formatter fenced, no legacy fallback");
++      return;
++    }
++    api.logger.info("registered preview-safe usage formatter through host finalUsageFooter.v1 capability");
++    return;
++  }
++  // Preserve the old plugin mode; unknown mode is fail-closed, not legacy.
++  if (options.deliveryMode !== undefined && options.deliveryMode !== "legacy-final") {
++    api.logger.warn("unknown footer deliveryMode; no hooks registered");
++    return;
++  }
++  api.on("reply_payload_sending", async (event, context) => {
++    if (!isTelegramFinalEvent(event, context)) return;
++    const footer = formatUsageFooter(event.usageState, options);
++    if (!footer) return;
++    const payload = appendUsageFooter(event.payload, footer);
++    if (payload === event.payload) return;
++    return { payload };
++  }, { priority: 100 });
++  api.logger.info("registered legacy Telegram final-reply usage hook (disables native preview on 2026.10.1)");
++}
+diff --git a/test/fixtures/turn-display-plugins/progress/aggregator.mjs b/test/fixtures/turn-display-plugins/progress/aggregator.mjs
+new file mode 100644
+index 00000000..89032fd5
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/progress/aggregator.mjs
+@@ -0,0 +1,112 @@
++/** Pure reducer. No SDK internals, credentials, network, arguments or result rendering. */
++const TOOLS = Object.freeze({
++  read: 'Read', ls: 'Read', file_fetch: 'Read', dir_list: 'Read', dir_fetch: 'Read',
++  exec: 'Exec', bash: 'Exec', process: 'Exec', terminal: 'Exec',
++  search: 'Search', web_search: 'Search', memory_search: 'Search', tool_search: 'Search',
++  skills_search: 'Search', sessions_search: 'Search',
++  write: 'Write', edit: 'Write', apply_patch: 'Write', file_write: 'Write',
++  web_fetch: 'Fetch', browser: 'Browser', computer: 'Browser',
++  sessions_spawn: 'Delegate', subagents: 'Delegate', agents_wait: 'Delegate',
++});
++const LABELS = Object.freeze({ Read: '读取资料', Exec: '执行操作', Search: '检索信息',
++  Write: '更新文件', Fetch: '获取资料', Browser: '操作页面', Delegate: '协作处理', Other: '处理任务' });
++const ICONS = Object.freeze({ running: '⏳', waiting: '…', completed: '✅', failed: '⚠️', cancelled: '⏹' });
++const SUFFIX = Object.freeze({ running: '进行中', waiting: '等待中', completed: '已完成', failed: '未完成', cancelled: '已取消' });
++const END = new Set(['completed', 'failed', 'cancelled']);
++function nonempty(x) { return typeof x === 'string' && x.length > 0 && x.length <= 1024; }
++export function normalizeScope(scope) {
++  if (!scope || !['accountId', 'chatId', 'sessionId', 'runId'].every(k => nonempty(scope[k])) ||
++      (scope.threadId !== undefined && scope.threadId !== '' && !nonempty(scope.threadId))) throw new TypeError('Explicit account/chat/session/run identities required');
++  return Object.freeze(Object.fromEntries(['accountId', 'chatId', 'threadId', 'sessionId', 'runId']
++    .map(k => [k, scope[k] ?? ''])));
++}
++export function scopeKey(scope) { const s = normalizeScope(scope); return JSON.stringify(Object.values(s)); }
++export function categoryForTool(name) {
++  if (typeof name !== 'string' || name.length > 200) return 'Other';
++  const tool = name.toLowerCase().split(/[.:/]/).at(-1);
++  if (tool.startsWith('camofox_')) return 'Browser';
++  return TOOLS[tool] ?? 'Other';
++}
++function bounded(n, fallback, max) {
++  n ??= fallback;
++  if (!Number.isSafeInteger(n) || n < 1 || n > max) throw new RangeError('Invalid capacity');
++  return n;
++}
++
++export class CompactProgress {
++  #runs = new Map();
++  constructor({ maxCategories = 3, maxRuns = 512, maxCallsPerRun = 4096 } = {}) {
++    this.maxCategories = bounded(maxCategories, 3, 8);
++    this.maxRuns = bounded(maxRuns, 512, 100000);
++    this.maxCallsPerRun = bounded(maxCallsPerRun, 4096, 100000);
++    Object.freeze(this); // capacities cannot be changed after validation
++  }
++  /** Explicit admission only: no event can implicitly create/reopen a run. */
++  begin(scope) {
++    const key = scopeKey(scope);
++    if (this.#runs.has(key)) return false;
++    // Do not evict terminal tombstones: that would permit late reactivation.
++    if (this.#runs.size >= this.maxRuns) return false;
++    this.#runs.set(key, { scope: normalizeScope(scope), closed: false, revision: 0,
++      calls: new Map(), categories: new Map(), order: [] });
++    return true;
++  }
++  apply(scope, event) {
++    const r = this.#runs.get(scopeKey(scope));
++    const reject = reason => ({ accepted: false, visibleChanged: false, reason });
++    if (!r) return reject('unadmitted-run');
++    if (r.closed) return reject('closed-run');
++    if (!event || !nonempty(event.callId) || !Number.isSafeInteger(event.seq) || event.seq < 0 ||
++        !['start', 'status', 'end'].includes(event.phase)) return reject('invalid-event');
++    let call = r.calls.get(event.callId);
++    if (event.phase === 'start') {
++      if (call) return reject('duplicate-start');
++      if (!nonempty(event.toolName)) return reject('missing-tool');
++      if (r.calls.size >= this.maxCallsPerRun) return reject('call-capacity');
++      const category = categoryForTool(event.toolName);
++      const prior = r.categories.get(category);
++      // A delayed/replayed older start must not take ownership from a newer call.
++      if (prior && event.seq <= prior.startSeq) return reject('stale-start');
++      call = { category, toolName: event.toolName, startSeq: event.seq,
++        seq: event.seq, status: 'running', terminal: false };
++      r.calls.set(event.callId, call);
++      r.categories.set(category, { callId: event.callId, startSeq: event.seq, status: call.status });
++    } else {
++      if (!call) return reject('unknown-call');
++      if (event.toolName !== undefined && event.toolName !== call.toolName) return reject('tool-mismatch');
++      if (call.terminal) return reject('terminal-call');
++      if (event.seq <= call.seq) return reject('stale-event');
++      const allowed = event.phase === 'status' ? ['running', 'waiting'] : [...END];
++      if (!allowed.includes(event.status)) return reject('invalid-status');
++      call.seq = event.seq;
++      call.status = event.status;
++      call.terminal = END.has(event.status);
++      const row = r.categories.get(call.category);
++      // Completion/status of an older parallel call must never overwrite the latest one.
++      if (row.callId !== event.callId) return { accepted: true, visibleChanged: false, reason: 'superseded-call' };
++      row.status = call.status;
++    }
++    // Most recently accepted activity is last; evicted categories can re-enter.
++    r.order = [...r.order.filter(c => c !== call.category), call.category].slice(-this.maxCategories);
++    r.revision++;
++    return { accepted: true, visibleChanged: true, reason: 'updated' };
++  }
++  close(scope) {
++    const r = this.#runs.get(scopeKey(scope));
++    if (!r || r.closed) return false;
++    r.closed = true;
++    r.revision++;
++    r.calls.clear(); r.categories.clear(); r.order = [];
++    return true;
++  }
++  snapshot(scope) {
++    const r = this.#runs.get(scopeKey(scope));
++    if (!r) return undefined;
++    const rows = r.order.map(category => {
++      const status = r.categories.get(category).status;
++      return Object.freeze({ category, status, text: `${ICONS[status]} ${category} · ${LABELS[category]} · ${SUFFIX[status]}` });
++    });
++    return Object.freeze({ closed: r.closed, revision: r.revision, rows: Object.freeze(rows),
++      text: rows.map(row => row.text).join('\n') });
++  }
++}
+diff --git a/test/fixtures/turn-display-plugins/progress/registration.mjs b/test/fixtures/turn-display-plugins/progress/registration.mjs
+new file mode 100644
+index 00000000..952e4b3f
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/progress/registration.mjs
+@@ -0,0 +1,52 @@
++import { CompactProgress } from './aggregator.mjs';
++
++export const PROGRESS_CAPABILITY = 'ordinaryToolProgress.v1';
++/** Display-only plugin adapter; the real host keeps compositor and Telegram custody. */
++export function createProgressReducer({ signal } = {}) {
++  const leases = new WeakMap();
++  return event => {
++    if (signal?.aborted || !event?.lease || typeof event.lease !== 'object') return;
++    let state = leases.get(event.lease);
++    if (event.phase === 'begin') {
++      if (state) return;
++      const s = event.scope;
++      if (s?.channel !== 'telegram' || !s.sessionId || !s.sessionKey ||
++          (s.threadId !== null && typeof s.threadId !== 'string')) return;
++      const scope = { accountId: s.accountId, chatId: s.conversationId,
++        threadId: s.threadId ?? '', sessionId: s.sessionId, runId: s.runId };
++      const reducer = new CompactProgress({ maxCategories: 3, maxRuns: 1 });
++      try { reducer.begin(scope); } catch { return; }
++      state = { scope, route: JSON.stringify(s), reducer, closed: event.replay !== false };
++      leases.set(event.lease, state);
++      return;
++    }
++    if (!state || state.closed || JSON.stringify(event.scope) !== state.route) return;
++    if (['cancel', 'failed', 'settled', 'finalize'].includes(event.phase)) {
++      state.closed = true; state.reducer.close(state.scope); return;
++    }
++    if (event.phase !== 'progress' || event.replay !== false || event.signal?.aborted) return;
++    state.reducer.apply(state.scope, event.event);
++    return state.reducer.snapshot(state.scope).rows;
++  };
++}
++export function registerProgressPlugin(api) {
++  if (api.pluginConfig?.enabled === false) return;
++  const capability = api.runtime?.channel?.runtimeContexts?.get({
++    channelId: 'telegram', capability: PROGRESS_CAPABILITY,
++  });
++  if (capability?.version !== 1 || typeof capability.register !== 'function' ||
++      !api.lifecycle?.signal || typeof api.lifecycle.onDispose !== 'function') {
++    api.logger.warn('compact progress inactive: host ordinaryToolProgress.v1 capability unavailable');
++    return;
++  }
++  const controller = new AbortController();
++  const signal = AbortSignal.any([api.lifecycle.signal, controller.signal]);
++  try {
++    const handle = capability.register({ pluginId: 'compact-telegram-progress', signal,
++      onLifecycle: createProgressReducer({ signal }) });
++    api.lifecycle.onDispose(() => { controller.abort(); handle.dispose(); });
++  } catch {
++    controller.abort();
++    api.logger.warn('compact progress registration refused; native progress unchanged');
++  }
++}
+diff --git a/test/fixtures/turn-display-plugins/registry.ts b/test/fixtures/turn-display-plugins/registry.ts
+new file mode 100644
+index 00000000..38b280b9
+--- /dev/null
++++ b/test/fixtures/turn-display-plugins/registry.ts
+@@ -0,0 +1,25 @@
++import { createPluginRecord } from "../../../src/plugins/loader-records.js";
++import { getPluginInstance } from "../../../src/plugins/plugin-instance-scope.js";
++import { markPluginRegistryActive } from "../../../src/plugins/registry-lifecycle.js";
++import { createRuntimeTestRegistry } from "../../../src/plugins/registry-runtime.test-helpers.js";
++import { createChannelRuntimeContextRegistry } from "../../../src/plugins/runtime/channel-runtime-contexts.js";
++import type { PluginRuntime } from "../../../src/plugins/runtime/types.js";
++
++export function pluginFixture(id: string, pluginConfig = {}, activate = true) {
++  // Only channel contexts are consumed; no config, provider, token or transport is loaded.
++  const runtime = {
++    channel: { runtimeContexts: createChannelRuntimeContextRegistry() },
++  } as PluginRuntime;
++  const builder = createRuntimeTestRegistry(runtime);
++  const record = createPluginRecord({
++    id,
++    source: `/synthetic/${id}/index.js`,
++    origin: "global",
++    enabled: true,
++    configSchema: false,
++  });
++  const api = builder.createApi(record, { config: {}, pluginConfig });
++  if (activate) markPluginRegistryActive(builder.registry);
++  const instance = getPluginInstance(record)!;
++  return { api, instance, builder, runtime };
++}

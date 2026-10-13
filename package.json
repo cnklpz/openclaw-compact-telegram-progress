@@ -1,0 +1,43 @@
+{
+  "name": "compact-telegram-progress",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Display-only Telegram category reducer through host ordinaryToolProgress.v1; no modifying hooks",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "demo": "node demo.mjs",
+    "check": "node --check aggregator.mjs && node --check lifecycle.mjs && node --check registration.mjs && node --check index.mjs"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.10.1",
+      "minGatewayVersion": "2026.10.1"
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cnklpz/openclaw-compact-telegram-progress.git"
+  },
+  "homepage": "https://github.com/cnklpz/openclaw-compact-telegram-progress#readme",
+  "bugs": {
+    "url": "https://github.com/cnklpz/openclaw-compact-telegram-progress/issues"
+  },
+  "files": [
+    "index.mjs",
+    "registration.mjs",
+    "aggregator.mjs",
+    "lifecycle.mjs",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ]
+}
